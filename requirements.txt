@@ -1,0 +1,6 @@
+aiortc>=1.14
+aiohttp>=3.14
+av
+cryptography
+mss>=9.0
+numpy>=2.0

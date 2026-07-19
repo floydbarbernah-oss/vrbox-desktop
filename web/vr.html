@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>VRBox Desktop — VR</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:system-ui,-apple-system,sans-serif;color:#eee}
+  canvas{display:block}
+  button{touch-action:manipulation}
+  #panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px;background:#0b0b0f;text-align:center;padding:24px;z-index:10}
+  #panel button{font-size:19px;padding:13px 26px;border:0;border-radius:12px;background:#4f7cff;
+    color:#fff;font-weight:600}
+  small{opacity:.75;max-width:470px;line-height:1.45}
+  #err{color:#ff6b6b}
+</style>
+</head>
+<body>
+<!-- Видео на весь экран, но ПОД непрозрачным canvas: iOS обновляет кадры только у "видимого" видео. -->
+<video id="video" playsinline webkit-playsinline autoplay muted style="display:none"></video>
+<video id="cam" playsinline webkit-playsinline autoplay muted style="display:none"></video>
+<div id="panel">
+  <h2>VRBox Desktop — VR</h2>
+  <small>Разверни телефон горизонтально, нажми «Войти», разреши доступ к движению.
+  Управление взглядом: наведи прицел на кнопку над экраном и задержи ~1 сек.</small>
+  <button id="go">Войти в VR</button>
+  <button id="arbtn" style="background:#2a2a33;font-size:16px;padding:11px 22px">Включить AR-камеру (по желанию)</button>
+  <small id="err"></small>
+  <small>AR-фон — отдельная кнопка (свой запрос камеры). Хочешь комнату за экраном — нажми её.
+  Полный экран без панелей Safari: Поделиться → «На экран Домой».</small>
+</div>
+
+<script src="/vendor/three.min.js"></script>
+<script src="/vendor/StereoEffect.js"></script>
+<script src="/vendor/DeviceOrientationControls.js"></script>
+<script>
+const video = document.getElementById('video');
+const cam = document.getElementById('cam');
+const panel = document.getElementById('panel');
+const err = document.getElementById('err');
+const TOKEN = new URLSearchParams(location.search).get('k') || '';
+
+let pcRef = null;                                   // для getStats -> HUD
+let hudMesh = null, hudCanvas = null, hudCtx = null;
+const metrics = { vw: 0, vh: 0, dfps: 0, kbps: 0, jit: 0, rfps: 0 };
+let fpsFrames = 0, fpsT0 = 0, _lastBytes = 0, _lastTs = 0;
+
+let scene, camera, renderer, effect, controls;
+let reticle, videoTex, grid, camStream, camTex, arOn = false;
+let menuGroup;                     // меню плавает над ВЫБРАННЫМ экраном
+const screens = [];                // {idx,group,scaleGroup,mesh,selBtn,mon,dist,minimized,savedScale}
+const screenMeshes = [];           // панели АКТИВНЫХ экранов для наведения курсора
+const selButtons = [];             // кнопки выбора под экранами (gaze-цели)
+let sel = 0;                       // индекс выбранного экрана
+let screen2On = false;             // второй экран добавлен?
+let movingScreen = null;           // какой экран сейчас «за головой» при перемещении
+let layout = null;                 // раскладка мониторов с сервера
+const SW = 3.4, SH = SW * 9 / 16;  // размер панели экрана в VR
+let dc;
+
+const raycaster = new THREE.Raycaster();
+const CENTER = { x: 0, y: 0 };
+const DWELL_MS = 1000, COOLDOWN_MS = 700, MOVE_HOLD_MS = 900, STILL_ANG = 0.02;
+let dwellTarget = null, dwellStart = 0, cooldownUntil = 0;
+let stillTime = 0, lastNow = 0;
+// --- предсказание позы головы: экстраполируем ориентацию на PREDICT_S вперёд, ---
+// --- чтобы скомпенсировать задержку motion-to-photon (меньше «плавания»). ---
+const PREDICT_S = 0.025;                    // сек вперёд. 0 = ВЫКЛ (точно как без предсказания).
+const OMEGA_LP = 0.4;                       // сглаживание угловой скорости (0..1; выше = резче/шумнее)
+const qMeas = new THREE.Quaternion();       // измеренная ориентация (для still-детекта «Переместить»)
+const qPrevMeas = new THREE.Quaternion();
+const omega = new THREE.Vector3();          // сглаженная угловая скорость (world, rad/s)
+const _qPrevInv = new THREE.Quaternion();
+const _dq = new THREE.Quaternion();
+const _predDelta = new THREE.Quaternion();
+const _axis = new THREE.Vector3();
+let measAng = 0;                            // угловое смещение измеренной ориентации за кадр
+let havePrev = false;
+const menuMeshes = [];        // все gaze-цели меню (хэндл + кнопки действий)
+const actionMeshes = [];      // кнопки действий (видны только когда меню развёрнуто)
+let toggleBtn = null;         // кнопка-хэндл: одна всегда видна, разворачивает сетку
+let menuOpen = false;         // меню развёрнуто?
+let lastCursor = 0;
+// gaze-стикинес: не переключать цель на соседнюю от дрожания, пока новая не удержится SWITCH_MS
+let pendingT = null, pendingSince = 0;
+const SWITCH_MS = 130;
+// премиум-вид/комфорт: раскладка меню в зоне комфорта, чуть вынесена вперёд экрана
+// меню НИЖЕ линии взгляда (смотреть вниз комфортнее, чем запрокидывать голову; как чехол окна у Vision Pro)
+// хэндл вынесен ПОД экран и вправо — не перекрывает панель задач и кнопку «Экран» (она по центру снизу)
+const TOGGLE_X = 0.95, TOGGLE_Y = -1.18, GRID_Y0 = -0.6, GRID_RGAP = 0.28, GRID_COLS = 5, GRID_GAP = 0.52, MENU_Z = 0.16;
+const MENU_ARC_R = 2.6;      // радиус дуги меню: кнопки лежат на дуге и повёрнуты лицом к зрителю (края читаемы)
+const RENDER_FPS = 30, RENDER_MIN_MS = 1000 / RENDER_FPS - 1;   // кап рендера (стерео дважды/кадр — главный расход/нагрев); 0 в RENDER_FPS не ставить
+const CURVE_DEPTH = 0.5;      // кривизна экрана: насколько края выгнуты к зрителю (0 = плоский); растёт с размером
+const eyeSep = 0.062;         // стерео-база StereoEffect (зашитый дефолт; ручку IPD убрали — на плоском экране незаметна)
+let nightOn = false;          // «Ночь» — приглушить яркость экрана
+
+let streamMode = 'focus';   // 'focus' = один монитор 1920 (чётко) | 'dual' = объединённый 3840
+let focusMon = 0;           // какой реальный монитор показываем в focus
+let layoutMons = [], layoutCombined = null;
+
+async function connect() {
+  const pc = new RTCPeerConnection();
+  pcRef = pc;
+  dc = pc.createDataChannel('ctrl');
+  dc.addEventListener('open', () => sendStream());   // сообщить серверу текущий режим стрима
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.ontrack = (e) => {
+    video.srcObject = e.streams[0]; video.play().catch(() => {});
+    // отключаем сглаживающий jitter buffer — кадры рисуются сразу (−задержка головы/курсора)
+    try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+    try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
+  };
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise((r) => {
+    if (pc.iceGatheringState === 'complete') return r();
+    pc.addEventListener('icegatheringstatechange',
+      () => pc.iceGatheringState === 'complete' && r());
+  });
+  const res = await fetch('/offer?k=' + encodeURIComponent(TOKEN), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+  });
+  if (res.status === 403) throw new Error('нет ключа доступа (открой ссылку с ?k=...)');
+  await pc.setRemoteDescription(await res.json());
+}
+
+// ---- размещение (каждый экран двигается независимо) ----
+function cur() { return screens[sel]; }
+function grabToHead(s) {
+  camera.add(s.group);
+  s.group.position.set(0, 0, -s.dist);
+  s.group.rotation.set(0, 0, 0);
+}
+function dropToWorld(s) {
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir); dir.y = 0;
+  if (dir.lengthSq() < 1e-4) dir.set(0, 0, -1);
+  dir.normalize();
+  scene.add(s.group);
+  s.group.position.set(dir.x * s.dist, 0, dir.z * s.dist);
+  s.group.rotation.set(0, Math.atan2(-dir.x, -dir.z), 0);
+}
+function refreshDistance(s) {
+  if (s.group.parent === camera) { s.group.position.set(0, 0, -s.dist); return; }
+  const p = s.group.position, len = Math.hypot(p.x, p.z) || 1;
+  s.group.position.set(p.x / len * s.dist, 0, p.z / len * s.dist);
+}
+
+// ---- действия меню (над ВЫБРАННЫМ экраном) ----
+function setMenuVisible(v) {
+  menuMeshes.forEach((m) => (m.visible = false));
+  if (v) { if (toggleBtn) toggleBtn.visible = true; actionMeshes.forEach((m) => (m.visible = menuOpen)); }
+}
+function doCloser()  { const s = cur(); s.dist = Math.max(1.2, s.dist - 0.4); refreshDistance(s); }
+function doFarther() { const s = cur(); s.dist = Math.min(9, s.dist + 0.4); refreshDistance(s); }
+function doBigger()  { const s = cur(); if (!s.minimized) s.scaleGroup.scale.multiplyScalar(1.12); }
+function doSmaller() { const s = cur(); if (!s.minimized) s.scaleGroup.scale.multiplyScalar(1 / 1.12); }
+function doMinimize() {
+  const s = cur();
+  s.minimized = !s.minimized;
+  if (s.minimized) { s.savedScale = s.scaleGroup.scale.x; s.scaleGroup.scale.setScalar(s.savedScale * 0.32); }
+  else s.scaleGroup.scale.setScalar(s.savedScale);
+  setLabel('min', s.minimized ? 'Развернуть' : 'Свернуть');
+}
+function doAR() {
+  if (!camTex) { return; }               // камера ещё не включена (кнопкой на входе)
+  arOn = !arOn;
+  scene.background = arOn ? camTex : new THREE.Color(0x05070d);
+  if (grid) grid.visible = !arOn;
+  setLabel('ar', arOn ? 'AR выкл' : 'AR');
+}
+
+// включение камеры под ОТДЕЛЬНЫЙ тап (getUserMedia требует свой user gesture)
+async function enableCam() {
+  const b = document.getElementById('arbtn');
+  if (!camStream) {
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+      cam.srcObject = camStream; cam.play().catch(() => {});
+    } catch (e) { err.textContent = 'Камера: ' + e.message; return; }
+  }
+  if (typeof THREE !== 'undefined' && scene && !camTex) {
+    camTex = new THREE.VideoTexture(cam); camTex.minFilter = THREE.LinearFilter;
+  }
+  if (scene && camTex && !arOn) doAR();   // если уже в VR — сразу включим фон
+  if (b) b.textContent = 'AR-камера включена ✓';
+}
+// эталонные UV геометрии (0..1) — чтобы кроп/фулл работали при любом числе вершин (сегменты для кривизны)
+function baseUV(geom) {
+  if (!geom.userData.baseUV) geom.userData.baseUV = geom.attributes.uv.array.slice();
+  return geom.userData.baseUV;
+}
+// раскладка UV на весь кадр (focus: панель = один монитор целиком)
+function setUVFull(mesh) {
+  const uv = mesh.geometry.attributes.uv, b = baseUV(mesh.geometry);
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, b[i * 2], b[i * 2 + 1]);
+  uv.needsUpdate = true;
+}
+function sendStream() {
+  if (dc && dc.readyState === 'open') dc.send(JSON.stringify({ t: 'stream', mode: streamMode, mon: focusMon }));
+}
+// применить режим стрима: focus (один монитор 1920) | dual (объединённый 3840, два экрана)
+function applyMode() {
+  if (streamMode === 'focus') {
+    const fi = Math.min(Math.max(0, focusMon), screens.length - 1);
+    focusMon = fi; sel = fi; screen2On = false;
+    screens.forEach((s, i) => { s.group.visible = (i === fi); s.selBtn.visible = false; });
+    const s = screens[fi];
+    setUVFull(s.mesh);                       // сервер шлёт только этот монитор -> панель = весь кадр
+    s.mesh.userData.mon = layoutMons[fi];
+    s.group.position.set(0, 0, -s.dist); s.group.rotation.set(0, 0, 0);
+    s.group.add(menuGroup); menuGroup.position.set(0, 0, 0);
+    screenMeshes.length = 0; screenMeshes.push(s.mesh);
+    setLabel('mode', '2 экрана');
+    setLabel('min', s.minimized ? 'Развернуть' : 'Свернуть');
+  } else {
+    screen2On = screens.length > 1;
+    screens.forEach((s, i) => {
+      s.group.visible = true;
+      cropUV(s.mesh.geometry, layoutMons[i], layoutCombined);   // объединённый кадр -> обрезка на монитор
+      s.mesh.userData.mon = layoutMons[i];
+      s.group.rotation.set(0, 0, 0);
+    });
+    screens[0].group.position.set(0, 0, -screens[0].dist);
+    if (screens[1]) screens[1].group.position.set(SW + 0.3, 0, -screens[1].dist);
+    selButtons.forEach((b) => (b.visible = screen2On));
+    screenMeshes.length = 0; screens.forEach((s) => screenMeshes.push(s.mesh));
+    setLabel('mode', '1 экран');
+    setSelected(Math.min(sel, screens.length - 1));
+  }
+  sendStream();
+}
+function doToggleMode() {
+  if (streamMode === 'focus') streamMode = 'dual';
+  else { streamMode = 'focus'; focusMon = sel; }   // в focus показываем выбранный монитор
+  applyMode();
+}
+function doMove() {
+  if (movingScreen) return;
+  movingScreen = cur(); stillTime = 0;
+  movingScreen.selBtn.visible = false;
+  grabToHead(movingScreen);
+  setMenuVisible(false);          // прячем меню, за головой едет только экран
+}
+function finishMove() {
+  const s = movingScreen;
+  dropToWorld(s);
+  if (screen2On) s.selBtn.visible = true;
+  movingScreen = null; stillTime = 0;
+  setMenuVisible(true);
+  reticle.material.color.setHex(0x66ff99);
+  reticle.scale.setScalar(1);
+}
+
+// ---- 3D-кнопки ----
+function roundRectPath(x, rx, ry, rw, rh, r) {
+  x.beginPath();
+  x.moveTo(rx + r, ry);
+  x.arcTo(rx + rw, ry, rx + rw, ry + rh, r);
+  x.arcTo(rx + rw, ry + rh, rx, ry + rh, r);
+  x.arcTo(rx, ry + rh, rx, ry, r);
+  x.arcTo(rx, ry, rx + rw, ry, r);
+  x.closePath();
+}
+// Премиум-«стекло» в духе visionOS: полупрозрачная тёмная таблетка, верхний блик, тонкая
+// светлая рамка. Прозрачность (alpha<1) даёт эффект матового стекла на тёмном фоне сцены.
+// Шрифт system-ui/-apple-system на iOS = San Francisco → «эппловский» вид без ассетов.
+function labelTexture(text, hi, accent) {
+  const W = 512, H = 200;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  x.clearRect(0, 0, W, H);
+  const pad = 12, rw = W - 2 * pad, rh = H - 2 * pad, r = rh * 0.40;
+  roundRectPath(x, pad, pad, rw, rh, r);
+  // тело — прозрачное нейтральное стекло (без цвета); в наведении чуть светлее (матовость)
+  x.fillStyle = hi ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)';
+  x.fill();
+  // верхний блик — намёк на стекло
+  const g = x.createLinearGradient(0, pad, 0, pad + rh);
+  g.addColorStop(0, 'rgba(255,255,255,0.22)');
+  g.addColorStop(0.45, 'rgba(255,255,255,0.05)');
+  g.addColorStop(1, 'rgba(255,255,255,0.0)');
+  x.fillStyle = g; x.fill();
+  // тонкая светлая рамка (в наведении ярче), тоже без цвета
+  roundRectPath(x, pad, pad, rw, rh, r);
+  x.lineWidth = hi ? 5 : 2.5;
+  x.strokeStyle = hi ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.35)';
+  x.stroke();
+  // текст: белый + тень, чтобы читался на любом фоне сквозь прозрачное стекло
+  x.shadowColor = 'rgba(0,0,0,0.65)'; x.shadowBlur = 8; x.shadowOffsetY = 1;
+  x.fillStyle = '#ffffff';
+  x.font = '500 58px -apple-system,system-ui,"SF Pro",sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(text, W / 2, H / 2 + 3);
+  return new THREE.CanvasTexture(c);
+}
+// низкоуровневая кнопка меню: в menuGroup + menuMeshes; accent = кнопка-хэндл (крупнее, синее)
+function makeMenuMesh(id, text, action, px, py, accent) {
+  const mat = new THREE.MeshBasicMaterial({ map: labelTexture(text, false, accent), transparent: true, depthTest: false });
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(accent ? 0.62 : 0.5, accent ? 0.24 : 0.2), mat);
+  const a = px / MENU_ARC_R;                                   // угол на дуге по горизонтальному слоту
+  mesh.position.set(MENU_ARC_R * Math.sin(a), py, MENU_Z + MENU_ARC_R * (1 - Math.cos(a)));  // края тянутся к зрителю
+  mesh.rotation.y = -a;                                        // и повёрнуты лицом к тебе — читаемы по всей ширине
+  mesh.renderOrder = 997;
+  mesh.userData = { id, text, action, hi: false, accent: !!accent };
+  menuGroup.add(mesh);
+  menuMeshes.push(mesh);
+  return mesh;
+}
+function makeButton(id, text, action, px, py) {
+  const m = makeMenuMesh(id, text, action, px, py, false);
+  actionMeshes.push(m);
+  return m;
+}
+// текстура кнопки выбора экрана (под панелью)
+function selTexture(text, on) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 96;
+  const x = c.getContext('2d');
+  x.fillStyle = on ? '#0f3d5a' : '#141a26'; x.fillRect(0, 0, 256, 96);
+  x.strokeStyle = on ? '#4fd0ff' : '#31435f'; x.lineWidth = 6; x.strokeRect(3, 3, 250, 90);
+  x.fillStyle = '#eaeefb'; x.font = 'bold 34px system-ui,sans-serif';
+  x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(text, 128, 50);
+  return new THREE.CanvasTexture(c);
+}
+function setLabel(id, text) {
+  const m = menuMeshes.find((b) => b.userData.id === id);
+  if (m) { m.userData.text = text; m.material.map = labelTexture(text, m.userData.hi, m.userData.accent); m.material.needsUpdate = true; }
+}
+function setHi(m, hi) {
+  if (m.userData.hi === hi) return;
+  m.userData.hi = hi;
+  m.material.map = labelTexture(m.userData.text, hi, m.userData.accent);
+  m.material.needsUpdate = true;
+}
+function buildMenu() {
+  const defs = [
+    ['mode', '2 экрана', doToggleMode], ['ar', 'AR', doAR],
+    ['closer', 'Ближе', doCloser], ['farther', 'Дальше', doFarther],
+    ['bigger', 'Больше', doBigger], ['smaller', 'Меньше', doSmaller],
+    ['min', 'Свернуть', doMinimize], ['move', 'Переместить', doMove],
+    ['night', 'Ночь', doNight],
+  ];
+  // сетка над экраном: заполняем ряды снизу вверх (нижний ряд ближе к хэндлу)
+  defs.forEach((d, i) => {
+    const r = Math.floor(i / GRID_COLS), col = i % GRID_COLS;
+    const inRow = Math.min(GRID_COLS, defs.length - r * GRID_COLS);
+    const px = -(inRow - 1) * GRID_GAP / 2 + col * GRID_GAP;
+    const py = GRID_Y0 + r * GRID_RGAP;
+    makeButton(d[0], d[1], d[2], px, py);
+  });
+  toggleBtn = makeMenuMesh('menu', 'Меню', doToggleMenu, TOGGLE_X, TOGGLE_Y, true);  // хэндл всегда виден, под экраном справа
+  setMenuOpen(false);
+}
+// развернуть/свернуть сетку меню (по кнопке-хэндлу)
+function setMenuOpen(open) {
+  menuOpen = open;
+  actionMeshes.forEach((m) => (m.visible = open));
+  if (toggleBtn) toggleBtn.visible = true;
+  setLabel('menu', open ? 'Свернуть' : 'Меню');
+  cooldownUntil = performance.now() + COOLDOWN_MS;   // не триггерить сразу после переключения
+  dwellTarget = null; pendingT = null;
+}
+function doToggleMenu() { setMenuOpen(!menuOpen); }
+// «Ночь»: приглушить яркость экрана (uniform bright у всех панелей)
+function doNight() {
+  nightOn = !nightOn;
+  screens.forEach((s) => { if (s.mesh.material.uniforms) s.mesh.material.uniforms.bright.value = nightOn ? 0.6 : 1.0; });
+  setLabel('night', nightOn ? 'День' : 'Ночь');
+}
+
+// материал экрана: видео + unsharp-mask (борьба с «мылом» WebRTC → читаемее текст)
+function makeScreenMaterial() {
+  const cw = (layout && layout.combined) ? layout.combined.width : 3840;
+  const ch = (layout && layout.combined) ? layout.combined.height : 1080;
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      tex: { value: videoTex },
+      texel: { value: new THREE.Vector2(1 / cw, 1 / ch) },
+      amount: { value: 0.6 },         // сила резкости; 0 = как было, ~0.4–0.7 разумно (поднято под DPR 1.5)
+      contrast: { value: 1.18 },      // >1 = глубже чёрный + читаемее текст (аналог local dimming шлемов)
+      bright: { value: 1.0 },         // яркость; «Ночь» ставит 0.6
+    },
+    vertexShader:
+      'varying vec2 vUv;' +
+      'void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader:
+      'precision mediump float;' +
+      'uniform sampler2D tex; uniform vec2 texel; uniform float amount, contrast, bright; varying vec2 vUv;' +
+      'void main(){' +
+      '  vec3 c = texture2D(tex, vUv).rgb;' +
+      '  vec3 b = texture2D(tex, vUv + vec2(texel.x,0.0)).rgb' +
+      '         + texture2D(tex, vUv - vec2(texel.x,0.0)).rgb' +
+      '         + texture2D(tex, vUv + vec2(0.0,texel.y)).rgb' +
+      '         + texture2D(tex, vUv - vec2(0.0,texel.y)).rgb;' +
+      '  b *= 0.25;' +
+      '  vec3 s = clamp(c + (c - b) * amount, 0.0, 1.0);' +   // резкость
+      '  s = clamp((s - 0.5) * contrast + 0.5, 0.0, 1.0);' +  // контраст вокруг серого
+      '  gl_FragColor = vec4(s * bright, 1.0);' +             // яркость
+      '}',
+  });
+}
+
+// один экран = панель + рамка + inner scale-group + кнопка выбора под ним
+function makeScreen(idx, mon, combined) {
+  const group = new THREE.Group();
+  const scaleGroup = new THREE.Group();
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(SW, SH, 40, 1), makeScreenMaterial());
+  applyCurve(mesh.geometry, CURVE_DEPTH, SW / 2);            // цилиндрическая гнутость (края к зрителю)
+  scaleGroup.add(mesh);                                      // без рамки-бортика — чистая панель
+  group.add(scaleGroup);
+  cropUV(mesh.geometry, mon, combined);
+  mesh.userData = { mon };
+  const selBtn = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 0.19),
+    new THREE.MeshBasicMaterial({ map: selTexture('Экран ' + (idx + 1), idx === 0), transparent: true }));
+  selBtn.position.set(0, -SH / 2 - 0.28, 0.02);
+  selBtn.visible = false;              // показываем, когда экранов ≥2
+  group.add(selBtn);
+  const s = { idx, group, scaleGroup, mesh, selBtn, mon, dist: 2.8, minimized: false, savedScale: 1 };
+  selBtn.userData = { screen: s };
+  scene.add(group);
+  screens.push(s);
+  selButtons.push(selBtn);
+  return s;
+}
+// одиночный выбор: подсветить кнопку выбранного, меню перелетает к нему
+function setSelected(i) {
+  sel = i;
+  screens.forEach((s, k) => {
+    s.selBtn.material.map = selTexture('Экран ' + (k + 1), k === i);
+    s.selBtn.material.needsUpdate = true;
+  });
+  screens[i].group.add(menuGroup);     // меню плывёт над выбранным экраном
+  menuGroup.position.set(0, 0, 0);
+  setLabel('min', screens[i].minimized ? 'Развернуть' : 'Свернуть');
+}
+
+// обрезать UV геометрии до региона монитора m внутри объединённого кадра c (для любого числа вершин)
+function cropUV(geom, m, c) {
+  const u0 = (m.left - c.left) / c.width;
+  const u1 = (m.left - c.left + m.width) / c.width;
+  const tf = (m.top - c.top) / c.height;
+  const v1 = 1 - tf, v0 = 1 - (tf + m.height / c.height);
+  const uv = geom.attributes.uv, b = baseUV(geom);
+  for (let i = 0; i < uv.count; i++) uv.setXY(i, u0 + b[i * 2] * (u1 - u0), v0 + b[i * 2 + 1] * (v1 - v0));
+  uv.needsUpdate = true;
+}
+// выгнуть плоскость в лёгкий цилиндр: край (|x|=halfW) уезжает на depth к зрителю. 0 = плоско.
+function applyCurve(geom, depth, halfW) {
+  if (depth <= 0) return;
+  const p = geom.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const t = p.getX(i) / halfW;
+    p.setZ(i, p.getZ(i) + depth * t * t);
+  }
+  p.needsUpdate = true;
+}
+
+function initThree() {
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x05070d);
+  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+  scene.add(camera);
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5)); // не 2: через линзы разницы нет, GPU/тепло ниже
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+  renderer.domElement.style.cssText = 'position:fixed;inset:0;z-index:1'; // canvas поверх видео
+  effect = new THREE.StereoEffect(renderer);
+  effect.setSize(innerWidth, innerHeight);
+  effect.setEyeSeparation(eyeSep);          // стерео-база (зашитый дефолт)
+  controls = new THREE.DeviceOrientationControls(camera);
+
+  const tex = new THREE.VideoTexture(video);
+  tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+  videoTex = tex;
+  if (camStream) { camTex = new THREE.VideoTexture(cam); camTex.minFilter = THREE.LinearFilter; }
+  menuGroup = new THREE.Group();
+  screens.length = 0; screenMeshes.length = 0; selButtons.length = 0; menuMeshes.length = 0; actionMeshes.length = 0;
+  const combined = (layout && layout.combined) ? layout.combined
+    : { left: 0, top: 0, width: SW, height: SH };
+  const mons = (layout && layout.monitors && layout.monitors.length) ? layout.monitors : [combined];
+  layoutMons = mons; layoutCombined = combined;
+  buildMenu();                              // кладёт кнопки в menuGroup
+  makeScreen(0, mons[0], combined);
+  if (mons[1]) makeScreen(1, mons[1], combined);
+  applyMode();                              // старт в focus: один монитор целиком, чётко
+
+  grid = new THREE.GridHelper(60, 60, 0x1b3a5a, 0x0f2237);
+  grid.position.y = -3; scene.add(grid);
+
+  reticle = new THREE.Mesh(new THREE.RingGeometry(0.010, 0.020, 24),
+    new THREE.MeshBasicMaterial({ color: 0x66ff99, transparent: true, opacity: 0.9, depthTest: false }));
+  reticle.position.set(0, 0, -1.2); reticle.renderOrder = 999;
+  camera.add(reticle);
+  buildHUD();
+  setInterval(pollStats, 1000);
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    effect.setSize(innerWidth, innerHeight);
+  });
+  animate();
+}
+
+function handleGaze(now) {
+  raycaster.setFromCamera(CENTER, camera);
+  const targets = menuMeshes.filter((m) => m.visible);         // скрытые кнопки — не цели
+  const hit = raycaster.intersectObjects(targets, false)[0];
+  const hm = hit ? hit.object : null;
+  // стикинес: держим текущую цель; переключаемся на новую, только если она удержалась SWITCH_MS
+  if (hm && hm === dwellTarget) { pendingT = null; }
+  else {
+    if (pendingT !== hm) { pendingT = hm; pendingSince = now; }
+    if (!dwellTarget || now - pendingSince >= (hm ? SWITCH_MS : SWITCH_MS + 40)) {
+      dwellTarget = hm; dwellStart = now; pendingT = null;
+    }
+  }
+  menuMeshes.forEach((m) => setHi(m, m === dwellTarget && m.visible));
+  if (dwellTarget) {
+    const m = dwellTarget;
+    const p = Math.min(1, (now - dwellStart) / DWELL_MS);
+    reticle.scale.setScalar(1 + p * 1.6);
+    if (p >= 1 && now > cooldownUntil) { cooldownUntil = now + COOLDOWN_MS; dwellStart = now; m.userData.action(); }
+    return;
+  }
+  // выбор экрана: посмотрел на кнопку под экраном → он выбран (мгновенно, одиночный выбор)
+  if (screen2On) {
+    const hitSel = raycaster.intersectObjects(selButtons, false)[0];
+    if (hitSel && hitSel.object.visible) {
+      setSelected(hitSel.object.userData.screen.idx);
+      dwellTarget = null; reticle.scale.setScalar(1.2);
+      return;
+    }
+  }
+  dwellTarget = null; reticle.scale.setScalar(1);
+  if (!movingScreen && dc && dc.readyState === 'open' && now - lastCursor > 45) {
+    const hitScr = raycaster.intersectObjects(screenMeshes, false)[0];
+    if (hitScr && hitScr.object.userData.mon) {
+      const mesh = hitScr.object;
+      const lp = mesh.worldToLocal(hitScr.point.clone());          // -> локальные координаты панели
+      const lu = Math.min(1, Math.max(0, (lp.x + SW / 2) / SW));
+      const lv = Math.min(1, Math.max(0, (lp.y + SH / 2) / SH));
+      const m = mesh.userData.mon;
+      dc.send(JSON.stringify({ t: 'move',
+        X: Math.round(m.left + lu * m.width),
+        Y: Math.round(m.top + (1 - lv) * m.height) }));
+      lastCursor = now;
+    }
+  }
+}
+
+function handleMove(dt) {
+  if (measAng < STILL_ANG) stillTime += dt; else stillTime = 0;
+  const p = Math.min(1, stillTime / MOVE_HOLD_MS);
+  reticle.material.color.setHex(0xffa94d);
+  reticle.scale.setScalar(1 + p * 2.2);
+  if (p >= 1) finishMove();
+}
+
+// экстраполяция ориентации вперёд по сглаженной угловой скорости
+function applyPrediction(dtMs) {
+  const dt = Math.max(1, dtMs) / 1000;
+  _qPrevInv.copy(qPrevMeas).invert();
+  _dq.multiplyQuaternions(qMeas, _qPrevInv);           // поворот за кадр (world)
+  if (_dq.w < 0) { _dq.x = -_dq.x; _dq.y = -_dq.y; _dq.z = -_dq.z; _dq.w = -_dq.w; } // короткий путь
+  const wq = Math.min(1, Math.max(-1, _dq.w));
+  const angle = 2 * Math.acos(wq);
+  const s = Math.sqrt(Math.max(0, 1 - wq * wq));
+  if (s > 1e-5) _axis.set(_dq.x / s, _dq.y / s, _dq.z / s); else _axis.set(0, 1, 0);
+  const rate = angle / dt;                              // rad/s вокруг _axis
+  omega.x += (_axis.x * rate - omega.x) * OMEGA_LP;     // EMA-сглаживание угловой скорости
+  omega.y += (_axis.y * rate - omega.y) * OMEGA_LP;
+  omega.z += (_axis.z * rate - omega.z) * OMEGA_LP;
+  if (PREDICT_S <= 0) return;
+  const mag = omega.length();
+  let pang = mag * PREDICT_S;
+  if (pang < 1e-6) return;
+  if (pang > 0.15) pang = 0.15;                         // страховка от рывка на выбросе
+  _axis.copy(omega).multiplyScalar(1 / mag);
+  _predDelta.setFromAxisAngle(_axis, pang);
+  camera.quaternion.multiplyQuaternions(_predDelta, qMeas).normalize();
+}
+
+// ---- HUD с метриками (чтобы решения про нагрев/качество принимать по цифрам, а не на глаз) ----
+function buildHUD() {
+  hudCanvas = document.createElement('canvas'); hudCanvas.width = 512; hudCanvas.height = 168;
+  hudCtx = hudCanvas.getContext('2d');
+  const t = new THREE.CanvasTexture(hudCanvas); t.minFilter = THREE.LinearFilter;
+  hudMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.92, 0.30),
+    new THREE.MeshBasicMaterial({ map: t, transparent: true, depthTest: false }));
+  hudMesh.position.set(0, -0.62, -1.4); hudMesh.renderOrder = 998;
+  camera.add(hudMesh);
+  updateHUD();
+}
+function updateHUD() {
+  if (!hudCtx) return;
+  const x = hudCtx;
+  x.clearRect(0, 0, 512, 168);
+  x.fillStyle = 'rgba(6,10,16,0.72)'; x.fillRect(0, 0, 512, 168);
+  x.fillStyle = '#8ff0a4'; x.font = 'bold 26px monospace';
+  x.fillText('VRBox · ' + (streamMode === 'focus' ? ('FOCUS m' + (focusMon + 1)) : 'DUAL'), 14, 34);
+  x.fillStyle = '#dfe6f5'; x.font = '24px monospace';
+  x.fillText('video ' + metrics.vw + 'x' + metrics.vh + '  dec ' + metrics.dfps + 'fps', 14, 74);
+  x.fillText('net ' + metrics.kbps + ' kbps  jit ' + metrics.jit + 'ms', 14, 110);
+  x.fillText('render ' + metrics.rfps + 'fps  dpr ' + renderer.getPixelRatio().toFixed(2), 14, 146);
+  hudMesh.material.map.needsUpdate = true;
+}
+function pollStats() {
+  if (!pcRef) return;
+  pcRef.getStats().then((rep) => {
+    rep.forEach((r) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        metrics.vw = r.frameWidth || 0; metrics.vh = r.frameHeight || 0;
+        metrics.dfps = Math.round(r.framesPerSecond || 0);
+        metrics.jit = r.jitter ? Math.round(r.jitter * 1000) : 0;
+        const ts = r.timestamp, by = r.bytesReceived || 0;
+        if (_lastTs && by >= _lastBytes) {
+          const dts = (ts - _lastTs) / 1000;
+          if (dts > 0) metrics.kbps = Math.round((by - _lastBytes) * 8 / 1000 / dts);
+        }
+        _lastBytes = by; _lastTs = ts;
+      }
+    });
+  }).catch(() => {});
+}
+
+let lastRenderT = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  if (now - lastRenderT < RENDER_MIN_MS) return;   // кап рендера: пропускаем кадр → меньше GPU/тепла
+  lastRenderT = now;
+  const dt = lastNow ? now - lastNow : 16;
+  lastNow = now;
+  fpsFrames++;
+  if (now - fpsT0 > 500) { metrics.rfps = Math.round(fpsFrames * 1000 / (now - fpsT0)); fpsFrames = 0; fpsT0 = now; updateHUD(); }
+  if (video.paused) video.play().catch(() => {});   // страховка: iOS иногда ставит на паузу
+  if (controls) controls.update();                  // -> camera.quaternion = измеренная ориентация
+  qMeas.copy(camera.quaternion);
+  if (!havePrev) { qPrevMeas.copy(qMeas); havePrev = true; }
+  measAng = qMeas.angleTo(qPrevMeas);
+  applyPrediction(dt);                              // -> camera.quaternion = предсказанная
+  if (movingScreen) handleMove(dt); else handleGaze(now);
+
+  // геймпад (если система его отдаёт браузеру — клон iOS обычно не отдаёт): клик на любую кнопку
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  let anyPressed = false;
+  for (const g of pads) { if (g && g.buttons.some((b) => b.pressed)) { anyPressed = true; break; } }
+  if (anyPressed && !window._btnPrev && dc && dc.readyState === 'open') dc.send(JSON.stringify({ t: 'click' }));
+  window._btnPrev = anyPressed;
+
+  effect.render(scene, camera);
+  qPrevMeas.copy(qMeas);
+}
+
+async function enterVR() {
+  err.textContent = '';
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const p = await DeviceOrientationEvent.requestPermission();
+      if (p !== 'granted') { err.textContent = 'Нет доступа к гироскопу'; return; }
+    }
+    await connect();
+    try { layout = await (await fetch('/monitors?k=' + encodeURIComponent(TOKEN))).json(); } catch (e) {}
+    panel.style.display = 'none';
+    initThree();
+  } catch (e) { err.textContent = 'Ошибка: ' + e.message; }
+}
+document.getElementById('go').addEventListener('click', enterVR);
+document.getElementById('go').addEventListener('touchend', (e) => { e.preventDefault(); enterVR(); }, { passive: false });
+document.getElementById('arbtn').addEventListener('click', enableCam);
+document.getElementById('arbtn').addEventListener('touchend', (e) => { e.preventDefault(); enableCam(); }, { passive: false });
+</script>
+</body>
+</html>

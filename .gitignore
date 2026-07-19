@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Секреты / машинно-зависимое
+# certs/: самоподписанный cert+key (key.pem приватный!) — пересоздать: python pc/make_cert.py
+certs/
+# .token: токен доступа, генерится сервером при первом запуске
+.token
+
+# Временное
+vr_tmp.js
+*.tmp
+# логи запуска сервера (start_vrbox.cmd / фоновый старт)
+_srv.log
+_srv_out.log
+_srv_err.log
+_vrcheck.js

@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>VRBox Desktop</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:system-ui,-apple-system,sans-serif;color:#eee}
+  #video{width:100vw;height:100vh;object-fit:contain;background:#000}
+  #panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px;background:#0b0b0f;text-align:center;padding:24px}
+  h2{margin:0;font-weight:600}
+  button{font-size:19px;padding:13px 26px;border:0;border-radius:12px;background:#4f7cff;
+    color:#fff;font-weight:600}
+  button.sec{background:#2a2a33}
+  a{color:#7aa2ff}
+  small{opacity:.75;max-width:460px;line-height:1.45}
+  #stats,#gyro{position:fixed;left:8px;font-size:12px;background:rgba(0,0,0,.55);
+    padding:5px 9px;border-radius:7px;font-variant-numeric:tabular-nums;display:none}
+  #stats{top:8px}#gyro{top:38px;color:#8ff0a4}
+  #err{color:#ff6b6b}
+  .step{background:#15151c;border-radius:12px;padding:14px 18px;max-width:460px;text-align:left}
+</style>
+</head>
+<body>
+<video id="video" playsinline autoplay muted></video>
+<div id="stats"></div>
+<div id="gyro"></div>
+<div id="panel"></div>
+<script>
+const panel=document.getElementById('panel'), v=document.getElementById('video'),
+      stats=document.getElementById('stats'), gyro=document.getElementById('gyro');
+const isHttps = location.protocol === 'https:';
+const httpsUrl = `https://${location.hostname}:8443`;
+
+function el(tag, html){ const e=document.createElement(tag); e.innerHTML=html; return e; }
+
+if (!isHttps) {
+  panel.append(
+    el('h2','VRBox Desktop — настройка'),
+    el('div','<div class="step"><b>Шаг 1.</b> Установи сертификат (нужен для гироскопа).<br>Нажми кнопку → «Разрешить» → профиль загрузится.</div>'),
+    (()=>{ const b=el('button','Установить сертификат'); b.onclick=()=>location.href='/cert'; return b; })(),
+    el('div','<div class="step"><b>Шаг 2.</b> Настройки → Основные → Об устройстве → <b>Доверие сертификатам</b> → включи «VRBox Desktop».</div>'),
+    el('div',`<div class="step"><b>Шаг 3.</b> Открой защищённую версию:<br><a href="${httpsUrl}">${httpsUrl}</a></div>`),
+  );
+} else {
+  const bGo=el('button','Подключить экран'); bGo.onclick=connect;
+  const bGyro=el('button','Тест гироскопа'); bGyro.className='sec'; bGyro.onclick=testGyro;
+  panel.append(
+    el('h2','VRBox Desktop — HTTPS'),
+    el('small','Сертификат доверен ✓. Проверяем: 1) видео по HTTPS, 2) доступ к гироскопу. Стерео добавим следующим шагом.'),
+    bGo, bGyro,
+    el('small',''),
+  );
+  const err=el('small'); err.id='err'; panel.append(err);
+  window._err=err;
+}
+
+async function connect(){
+  const err=window._err; if(err) err.textContent='';
+  try{
+    const pc=new RTCPeerConnection();
+    pc.addTransceiver('video',{direction:'recvonly'});
+    pc.ontrack=(e)=>{ v.srcObject=e.streams[0]; v.play().catch(()=>{}); };
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise((res)=>{ if(pc.iceGatheringState==='complete')return res();
+      pc.addEventListener('icegatheringstatechange',()=>pc.iceGatheringState==='complete'&&res()); });
+    const r=await fetch('/offer',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})});
+    await pc.setRemoteDescription(await r.json());
+    panel.style.display='none'; stats.style.display='block';
+    setInterval(async()=>{ (await pc.getStats()).forEach((rep)=>{
+      if(rep.type==='inbound-rtp'&&rep.kind==='video'){
+        const jit=rep.jitter?(rep.jitter*1000).toFixed(0):'0';
+        stats.textContent=`${rep.frameWidth||0}x${rep.frameHeight||0} · ${Math.round(rep.framesPerSecond||0)} fps · jitter ${jit} ms`;
+      }}); },1000);
+  }catch(e){ if(err) err.textContent='Ошибка: '+e.message; }
+}
+
+async function testGyro(){
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
+      const p=await DeviceOrientationEvent.requestPermission();
+      if(p!=='granted'){ window._err.textContent='Гироскоп: доступ отклонён'; return; }
+    }
+    gyro.style.display='block'; gyro.textContent='гироскоп: жду данные...';
+    window.addEventListener('deviceorientation',(e)=>{
+      gyro.textContent=`гироскоп  α ${(e.alpha||0).toFixed(0)}°  β ${(e.beta||0).toFixed(0)}°  γ ${(e.gamma||0).toFixed(0)}°`;
+    });
+  }catch(e){ window._err.textContent='Гироскоп: '+e.message; }
+}
+</script>
+</body>
+</html>
